@@ -199,9 +199,12 @@ async def test_sweep_mode(dut):
     # Trigger sweep (ctrl[2]=auto_sweep, ctrl[0]=start)
     await spi_write(dut, 0x00, 0x05)
 
+    # Sweep now goes through S_SENSE at each step — provide adc_ready
+    dut.ui_in.value = 0b00000010  # adc_ready=1
+
     # Wait for op_done (uo_out[3]) pulse — check every cycle
     op_done_seen = False
-    for _ in range(300):
+    for _ in range(500):
         await ClockCycles(dut.clk, 1)
         if (int(dut.uo_out.value) >> 3) & 1:
             op_done_seen = True
@@ -405,13 +408,14 @@ async def test_abort_clears_flags(dut):
 
 @cocotb.test()
 async def test_col_addr_output(dut):
-    """Verify full 3-bit col_addr output: uio[7]=col[0], uo[6]=col[1], uo[7]=col[2]."""
+    """Verify col_addr[0] on uio[7], and DAC[3:0] on uo_out[7:4]."""
     clock = Clock(dut.clk, 20, unit="ns")
     cocotb.start_soon(clock.start())
     await reset_dut(dut)
 
     for col_val in [0x00, 0x05, 0x07]:
         await spi_write(dut, 0x03, col_val)  # COL
+        await spi_write(dut, 0x06, 0xAB)     # DAC=0xAB
         await spi_write(dut, 0x01, 0x01)     # MODE=SET
         await spi_write(dut, 0x04, 0x03)     # short pulse
         await spi_write(dut, 0x00, 0x01)     # start
@@ -425,11 +429,22 @@ async def test_col_addr_output(dut):
         uio = int(dut.uio_out.value)
         uo = int(dut.uo_out.value)
         col0 = (uio >> 7) & 1
-        col1 = (uo >> 6) & 1
-        col2 = (uo >> 7) & 1
-        actual = (col2 << 2) | (col1 << 1) | col0
-        expected = col_val & 0x07
-        dut._log.info(f"col_val=0x{col_val:02x}: col[2:0]={col2}{col1}{col0} = {actual}")
+        dac_nibble = (uo >> 4) & 0x0F
+        dut._log.info(f"col_val=0x{col_val:02x}: col[0]={col0}, DAC[3:0]=0x{dac_nibble:x}")
+
+        # Verify col_addr[0] on uio_out[7]
+        expected_col0 = col_val & 1
+        assert col0 == expected_col0, \
+            f"col_addr[0] mismatch: expected {expected_col0}, got {col0}"
+
+        # Verify DAC[3:0] on uo_out[7:4]
+        assert dac_nibble == (0xAB & 0x0F), \
+            f"DAC nibble mismatch: expected 0x{0xAB & 0x0F:x}, got 0x{dac_nibble:x}"
+
+        # Verify full col_addr via SPI readback
+        col_rb = await spi_read(dut, 0x03)
+        assert (col_rb & 0x07) == (col_val & 0x07), \
+            f"col_addr SPI mismatch: expected 0x{col_val & 0x07:02x}, got 0x{col_rb & 0x07:02x}"
 
         # Complete operation
         dut.ui_in.value = 0b00000010  # adc_ready
@@ -437,10 +452,6 @@ async def test_col_addr_output(dut):
         await spi_write(dut, 0x00, 0x00)  # clear ctrl
         await ClockCycles(dut.clk, 5)
         dut.ui_in.value = 0
-
-        if col_val > 0:
-            assert actual == expected, \
-                f"col_addr mismatch: expected {expected}, got {actual}"
 
 
 @cocotb.test()
@@ -456,6 +467,9 @@ async def test_sweep_step_zero(dut):
     await spi_write(dut, 0x0B, 0x00)  # sweep_step=0 (was infinite loop!)
     await spi_write(dut, 0x00, 0x05)  # start + auto_sweep
 
+    # Sweep with step=0 does one pulse then goes to SENSE — provide adc_ready
+    dut.ui_in.value = 0b00000010  # adc_ready=1
+
     op_done = False
     for _ in range(200):
         await ClockCycles(dut.clk, 1)
@@ -465,3 +479,444 @@ async def test_sweep_step_zero(dut):
 
     dut._log.info(f"Sweep step=0: op_done={op_done}")
     assert op_done, "Sweep with step=0 should complete immediately, not hang"
+
+
+# ============================================================
+# SPI and FSM corner-case stress tests
+# ============================================================
+
+async def spi_write_fast(dut, addr, data):
+    """SPI write with minimum timing (2-cycle SCK half-periods)."""
+    cs_bit = 0
+    mosi_bit = 1
+    sck_bit = 3
+    word = ((addr & 0x7F) << 8) | (data & 0xFF)
+
+    dut.uio_in.value = 0  # CS=0
+    await ClockCycles(dut.clk, 2)
+
+    for i in range(16):
+        bit_val = (word >> (15 - i)) & 1
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit) | (1 << sck_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 1)
+
+    dut.uio_in.value = (1 << cs_bit)
+    await ClockCycles(dut.clk, 2)
+
+
+async def spi_read_fast(dut, addr):
+    """SPI read with minimum timing (2-cycle SCK half-periods)."""
+    cs_bit = 0
+    mosi_bit = 1
+    sck_bit = 3
+    word = (1 << 15) | ((addr & 0x7F) << 8)
+
+    dut.uio_in.value = 0
+    await ClockCycles(dut.clk, 2)
+
+    read_data = 0
+    for i in range(16):
+        bit_val = (word >> (15 - i)) & 1
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 2)
+        dut.uio_in.value = (bit_val << mosi_bit) | (1 << sck_bit)
+        await ClockCycles(dut.clk, 1)
+        if i >= 8:
+            miso = (int(dut.uio_out.value) >> 2) & 1
+            read_data = (read_data << 1) | miso
+        await ClockCycles(dut.clk, 1)
+        dut.uio_in.value = (bit_val << mosi_bit)
+        await ClockCycles(dut.clk, 1)
+
+    dut.uio_in.value = (1 << cs_bit)
+    await ClockCycles(dut.clk, 2)
+    return read_data
+
+
+@cocotb.test()
+async def test_spi_fast_timing(dut):
+    """SPI at maximum speed (2-cycle SCK): write/read all config registers."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    test_data = {0x01: 0x03, 0x02: 0x07, 0x03: 0x05, 0x04: 0xAA,
+                 0x05: 0x01, 0x06: 0xCD, 0x09: 0x10, 0x0A: 0xF0, 0x0B: 0x08}
+
+    for addr, val in test_data.items():
+        await spi_write_fast(dut, addr, val)
+
+    for addr, val in test_data.items():
+        rb = await spi_read_fast(dut, addr)
+        assert rb == val, f"Fast SPI reg 0x{addr:02x}: expected 0x{val:02x}, got 0x{rb:02x}"
+
+    dut._log.info("All fast-SPI register writes verified")
+
+
+@cocotb.test()
+async def test_spi_back_to_back(dut):
+    """Back-to-back SPI transactions with minimal CS inter-frame gap."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Write 10 registers back-to-back using fast SPI (1-cycle CS gap)
+    vals = [(0x02, i) for i in range(8)] + [(0x03, i) for i in range(2)]
+    for addr, val in vals:
+        await spi_write_fast(dut, addr, val)
+
+    # Verify last values stuck
+    row = await spi_read(dut, 0x02)
+    col = await spi_read(dut, 0x03)
+    assert row == 7, f"After back-to-back writes, row should be 7, got {row}"
+    assert col == 1, f"After back-to-back writes, col should be 1, got {col}"
+    dut._log.info("Back-to-back SPI verified")
+
+
+@cocotb.test()
+async def test_spi_read_during_operation(dut):
+    """Read status and ADC registers while FSM is actively pulsing."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # SET mode with long pulse
+    await spi_write(dut, 0x01, 0x01)
+    await spi_write(dut, 0x04, 0xFF)
+    await spi_write(dut, 0x05, 0x00)
+    await spi_write(dut, 0x06, 0x80)
+    await spi_write(dut, 0x00, 0x01)  # start
+
+    # Wait until FSM is active
+    for _ in range(50):
+        await ClockCycles(dut.clk, 1)
+        if int(dut.uo_out.value) & 1:
+            break
+
+    # Read status mid-operation — should show busy=1
+    status = await spi_read(dut, 0x07)
+    assert status & 0x01, f"FSM should be busy during pulse, status=0x{status:02x}"
+    dut._log.info(f"Mid-operation status: 0x{status:02x}")
+
+    # Read config regs mid-operation — should still return correct values
+    mode = await spi_read(dut, 0x01)
+    assert mode == 0x01, f"Mode should still be 0x01 during operation, got 0x{mode:02x}"
+
+    # Abort to clean up
+    await spi_write(dut, 0x00, 0x02)
+    await ClockCycles(dut.clk, 10)
+
+
+@cocotb.test()
+async def test_all_modes_sequence(dut):
+    """Exercise all 4 modes (READ/SET/RESET/FORM) back-to-back without reset."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    for mode_val, mode_name in [(0x00, "READ"), (0x01, "SET"), (0x02, "RESET"), (0x03, "FORM")]:
+        await spi_write(dut, 0x01, mode_val)
+        await spi_write(dut, 0x04, 0x03)  # short pulse
+        await spi_write(dut, 0x05, 0x00)
+        await spi_write(dut, 0x00, 0x01)  # start
+
+        dut.ui_in.value = 0b01100010  # adc_ready + adc_data
+
+        op_done = False
+        for _ in range(100):
+            await ClockCycles(dut.clk, 1)
+            if (int(dut.uo_out.value) >> 3) & 1:
+                op_done = True
+                break
+
+        assert op_done, f"Mode {mode_name} (0x{mode_val:02x}) should complete"
+        dut._log.info(f"Mode {mode_name} completed successfully")
+
+        # Clear for next iteration
+        await spi_write(dut, 0x00, 0x00)
+        dut.ui_in.value = 0
+        await ClockCycles(dut.clk, 5)
+
+
+@cocotb.test()
+async def test_register_boundary_values(dut):
+    """Write 0x00 and 0xFF to all writable registers, verify readback."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    writable = [0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x09, 0x0A, 0x0B, 0x0C]
+
+    # Test 0x00
+    for addr in writable:
+        await spi_write(dut, addr, 0x00)
+    for addr in writable:
+        rb = await spi_read(dut, addr)
+        assert rb == 0x00, f"Reg 0x{addr:02x} with 0x00: got 0x{rb:02x}"
+
+    # Test 0xFF
+    for addr in writable:
+        await spi_write(dut, addr, 0xFF)
+    for addr in writable:
+        rb = await spi_read(dut, addr)
+        assert rb == 0xFF, f"Reg 0x{addr:02x} with 0xFF: got 0x{rb:02x}"
+
+    dut._log.info("All register boundary values verified")
+
+
+@cocotb.test()
+async def test_repeat_register_readback(dut):
+    """Write and read back reg_repeat at address 0x0C."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Default should be 0x00
+    rb = await spi_read(dut, 0x0C)
+    assert rb == 0x00, f"Default reg_repeat should be 0x00, got 0x{rb:02x}"
+
+    await spi_write(dut, 0x0C, 0x35)  # repeat=5, gap=3*16=48
+    rb = await spi_read(dut, 0x0C)
+    assert rb == 0x35, f"Expected 0x35, got 0x{rb:02x}"
+
+    await spi_write(dut, 0x0C, 0xF0)  # repeat=0, gap=15*16=240
+    rb = await spi_read(dut, 0x0C)
+    assert rb == 0xF0, f"Expected 0xF0, got 0x{rb:02x}"
+    dut._log.info("reg_repeat readback OK")
+
+
+@cocotb.test()
+async def test_single_pulse_default(dut):
+    """With reg_repeat=0, behavior should be identical to original single-pulse."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # SET mode, pulse_width=10
+    await spi_write(dut, 0x01, 0x01)   # mode=SET
+    await spi_write(dut, 0x04, 0x0A)   # pulse_l=10
+    await spi_write(dut, 0x05, 0x00)   # pulse_h=0
+    await spi_write(dut, 0x0C, 0x00)   # repeat=0 (single pulse)
+
+    # Start
+    await spi_write(dut, 0x00, 0x01)
+
+    # Wait for pulse phase
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        uo = int(dut.uo_out.value)
+        if uo & 0x01:  # pulse_out
+            break
+
+    # Count pulse cycles
+    pulse_cycles = 0
+    for _ in range(50):
+        await RisingEdge(dut.clk)
+        uo = int(dut.uo_out.value)
+        if uo & 0x01:
+            pulse_cycles += 1
+        else:
+            break
+
+    dut._log.info(f"Single-pulse cycles with repeat=0: {pulse_cycles}")
+    assert pulse_cycles > 0, "Should have seen at least one pulse cycle"
+
+    # Provide ADC ready to finish, then wait for op_done on uo_out[3]
+    dut.ui_in.value = 0x02
+    op_done_seen = False
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if int(dut.uo_out.value) & 0x08:
+            op_done_seen = True
+            break
+    dut.ui_in.value = 0
+    assert op_done_seen, "op_done should pulse high"
+    dut._log.info("Single-pulse default behavior verified")
+
+
+@cocotb.test()
+async def test_pulse_train_3_pulses(dut):
+    """With reg_repeat=3, gap=0: should see 3 consecutive pulses."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # SET mode, short pulse_width=5
+    await spi_write(dut, 0x01, 0x01)   # mode=SET
+    await spi_write(dut, 0x04, 0x05)   # pulse_l=5
+    await spi_write(dut, 0x05, 0x00)   # pulse_h=0
+    await spi_write(dut, 0x0C, 0x03)   # repeat=3, gap=0*16=0
+
+    # Start
+    await spi_write(dut, 0x00, 0x01)
+
+    # Count distinct pulse bursts (transitions from 0→1)
+    pulse_count = 0
+    prev_pulse = 0
+    for _ in range(500):
+        await RisingEdge(dut.clk)
+        uo = int(dut.uo_out.value)
+        curr_pulse = uo & 0x01
+        if curr_pulse and not prev_pulse:
+            pulse_count += 1
+        prev_pulse = curr_pulse
+        # Check if we reached SENSE state (busy but no pulse, after all pulses)
+        if pulse_count >= 3 and not curr_pulse:
+            break
+
+    dut._log.info(f"Pulse bursts counted: {pulse_count}")
+    assert pulse_count == 3, f"Expected 3 pulse bursts, got {pulse_count}"
+
+    # Provide ADC ready, then watch for op_done pulse on uo_out[3]
+    dut.ui_in.value = 0x02
+    op_done_seen = False
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if int(dut.uo_out.value) & 0x08:
+            op_done_seen = True
+            break
+    dut.ui_in.value = 0
+    assert op_done_seen, "op_done should pulse high after pulse train"
+
+
+@cocotb.test()
+async def test_pulse_train_with_gap(dut):
+    """With reg_repeat=2, gap=1*16=16: should see 2 pulses with gap."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # SET mode, pulse_width=5
+    await spi_write(dut, 0x01, 0x01)   # mode=SET
+    await spi_write(dut, 0x04, 0x05)   # pulse_l=5
+    await spi_write(dut, 0x05, 0x00)   # pulse_h=0
+    await spi_write(dut, 0x0C, 0x12)   # repeat=2, gap=1*16=16 cycles
+
+    # Start
+    await spi_write(dut, 0x00, 0x01)
+
+    # Track pulse rising edges and gap between them
+    pulse_count = 0
+    prev_pulse = 0
+    gap_cycles = 0
+    measuring_gap = False
+
+    for _ in range(500):
+        await RisingEdge(dut.clk)
+        uo = int(dut.uo_out.value)
+        curr_pulse = uo & 0x01
+
+        if curr_pulse and not prev_pulse:
+            pulse_count += 1
+            if measuring_gap:
+                dut._log.info(f"Gap between pulses: {gap_cycles} cycles")
+                measuring_gap = False
+
+        if not curr_pulse and prev_pulse and pulse_count < 2:
+            measuring_gap = True
+            gap_cycles = 0
+
+        if measuring_gap and not curr_pulse:
+            gap_cycles += 1
+
+        prev_pulse = curr_pulse
+
+        if pulse_count >= 2 and not curr_pulse:
+            break
+
+    assert pulse_count == 2, f"Expected 2 pulse bursts, got {pulse_count}"
+    # Gap should be at least 16 cycles (gap_counter counts down from 16)
+    assert gap_cycles >= 16, f"Expected gap >= 16, got {gap_cycles}"
+
+    # Finish
+    dut.ui_in.value = 0x02
+    await ClockCycles(dut.clk, 30)
+    dut.ui_in.value = 0
+
+
+@cocotb.test()
+async def test_sweep_ignores_repeat(dut):
+    """In sweep mode, pulse-train should not apply (sweep_active blocks it)."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Setup with repeat=5 but sweep mode
+    await spi_write(dut, 0x01, 0x01)   # mode=SET
+    await spi_write(dut, 0x04, 0x05)   # pulse_l=5
+    await spi_write(dut, 0x05, 0x00)   # pulse_h=0
+    await spi_write(dut, 0x0C, 0x05)   # repeat=5, gap=0
+    await spi_write(dut, 0x09, 0x00)   # sweep_start=0
+    await spi_write(dut, 0x0A, 0x10)   # sweep_end=16
+    await spi_write(dut, 0x0B, 0x10)   # sweep_step=16
+
+    # Start with sweep (ctrl[2]=1)
+    await spi_write(dut, 0x00, 0x05)
+
+    # In sweep mode, each DAC step should produce exactly 1 pulse burst
+    # because sweep_active blocks the repeat logic.
+    # Count pulse rising edges for the first sweep step.
+    first_step_pulses = 0
+    prev_pulse = 0
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        uo = int(dut.uo_out.value)
+        curr_pulse = uo & 0x01
+        if curr_pulse and not prev_pulse:
+            first_step_pulses += 1
+        prev_pulse = curr_pulse
+        # After first pulse ends, check if we're done
+        if first_step_pulses >= 1 and not curr_pulse:
+            break
+
+    dut._log.info(f"First sweep step pulses: {first_step_pulses}")
+    assert first_step_pulses == 1, f"Sweep should produce single pulse per step, got {first_step_pulses}"
+
+    # Finish sweep by providing adc_ready for each step
+    for _ in range(5):
+        dut.ui_in.value = 0x02
+        await ClockCycles(dut.clk, 50)
+        dut.ui_in.value = 0
+        await ClockCycles(dut.clk, 50)
+
+    dut._log.info("Sweep correctly ignores repeat setting")
+
+
+@cocotb.test()
+async def test_abort_during_pulse_train(dut):
+    """Abort during a pulse train should stop immediately."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # SET mode, longish pulse, 5 repeats
+    await spi_write(dut, 0x01, 0x01)
+    await spi_write(dut, 0x04, 0x14)   # pulse_l=20
+    await spi_write(dut, 0x05, 0x00)
+    await spi_write(dut, 0x0C, 0x15)   # repeat=5, gap=1*16=16
+
+    # Start
+    await spi_write(dut, 0x00, 0x01)
+
+    # Wait for first pulse to start
+    for _ in range(200):
+        await RisingEdge(dut.clk)
+        if int(dut.uo_out.value) & 0x01:
+            break
+
+    # Abort
+    await spi_write(dut, 0x00, 0x02)
+    await ClockCycles(dut.clk, 10)
+
+    uo = int(dut.uo_out.value)
+    assert (uo & 0x01) == 0, "pulse_out should be 0 after abort"
+    assert (uo & 0x02) == 0, "row_en should be 0 after abort"
+    assert (uo & 0x04) == 0, "col_en should be 0 after abort"
+
+    status = await spi_read(dut, 0x07)
+    assert (status & 0x01) == 0, "FSM should be idle after abort"
+    dut._log.info("Abort during pulse train verified")
