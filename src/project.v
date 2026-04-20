@@ -8,6 +8,9 @@
  * - Configurable pulse width (1-511 clock cycles)
  * - 8-bit DAC code output for voltage control
  * - Automated voltage sweep mode for I-V characterization
+ * - Compliance current limit: auto-abort when ADC exceeds threshold
+ * - Pulse count register: tracks actual pulses delivered
+ * - V/2 half-select DAC: readable bias voltage for sneak-path mitigation
  * - SPI-configurable, device-agnostic standalone IP
  */
 
@@ -60,7 +63,7 @@ module tt_um_santhosh_xbar_ctrl (
     );
 
     // Configuration registers
-    reg [7:0] reg_ctrl;        // 0x00: [0]=start, [1]=abort, [2]=auto_sweep
+    reg [7:0] reg_ctrl;        // 0x00: [0]=start, [1]=abort, [2]=auto_sweep, [3]=compliance_en
     reg [7:0] reg_mode;        // 0x01: [1:0]=mode (00=READ,01=SET,10=RESET,11=FORM)
     reg [7:0] reg_row;         // 0x02: [2:0]=row address
     reg [7:0] reg_col;         // 0x03: [2:0]=col address
@@ -71,6 +74,7 @@ module tt_um_santhosh_xbar_ctrl (
     reg [7:0] reg_sweep_end;  // 0x0A: sweep end DAC
     reg [7:0] reg_sweep_step; // 0x0B: sweep increment
     reg [7:0] reg_repeat;     // 0x0C: [3:0]=repeat_count (0=single), [7:4]=gap×16 cycles
+    reg [7:0] reg_compliance;  // 0x0D: compliance ADC threshold (auto-abort if exceeded)
     wire [7:0] reg_status;     // 0x07: status (read-only)
     reg  [7:0] reg_adc_data;  // 0x08: last ADC reading (read-only)
 
@@ -88,6 +92,7 @@ module tt_um_santhosh_xbar_ctrl (
             reg_sweep_end   <= 8'hFF;
             reg_sweep_step  <= 8'h10;
             reg_repeat      <= 8'h00;    // Single pulse default
+            reg_compliance  <= 8'hFF;    // Max threshold (no limit)
         end else if (wr_en) begin
             case (wr_addr)
                 8'h00: reg_ctrl        <= wr_data;
@@ -101,6 +106,7 @@ module tt_um_santhosh_xbar_ctrl (
                 8'h0A: reg_sweep_end   <= wr_data;
                 8'h0B: reg_sweep_step  <= wr_data;
                 8'h0C: reg_repeat      <= wr_data;
+                8'h0D: reg_compliance  <= wr_data;
                 default: ;
             endcase
         end else begin
@@ -126,6 +132,9 @@ module tt_um_santhosh_xbar_ctrl (
             8'h0A: rd_data = reg_sweep_end;
             8'h0B: rd_data = reg_sweep_step;
             8'h0C: rd_data = reg_repeat;
+            8'h0D: rd_data = reg_compliance;
+            8'h0E: rd_data = pulse_count;
+            8'h0F: rd_data = {1'b0, active_dac[7:1]}; // V/2 half-select DAC
             default: rd_data = 8'h00;
         endcase
     end
@@ -162,6 +171,8 @@ module tt_um_santhosh_xbar_ctrl (
     reg        sweep_active;  // Flag: sweep in progress (for S_SENSE return path)
     reg [3:0]  repeat_cnt;    // Remaining pulse repetitions
     reg [7:0]  gap_counter;   // Inter-pulse gap countdown
+    reg        compliance_hit; // Compliance current limit exceeded
+    reg [7:0]  pulse_count;   // Actual pulses delivered
 
     wire [8:0] pulse_width = {reg_pulse_h[0], reg_pulse_l};
 
@@ -179,6 +190,8 @@ module tt_um_santhosh_xbar_ctrl (
             sweep_active  <= 1'b0;
             repeat_cnt    <= 4'd0;
             gap_counter   <= 8'd0;
+            compliance_hit <= 1'b0;
+            pulse_count   <= 8'd0;
         end else if (reg_ctrl[1]) begin
             // Abort: clear all outputs and flags
             state     <= S_IDLE;
@@ -199,6 +212,8 @@ module tt_um_santhosh_xbar_ctrl (
                     op_done   <= 1'b0;
                     op_error  <= 1'b0;
                     if (start_pulse) begin
+                        compliance_hit <= 1'b0;
+                        pulse_count   <= 8'd0;
                         if (reg_ctrl[2]) begin
                             // Sweep mode
                             sweep_dac     <= reg_sweep_start;
@@ -233,6 +248,7 @@ module tt_um_santhosh_xbar_ctrl (
                     if (pulse_counter >= pulse_width) begin
                         pulse_out     <= 1'b0;
                         pulse_counter <= 9'd0;  // Reset for S_SENSE timeout or gap
+                        pulse_count   <= pulse_count + 8'd1; // Track actual pulses
                         if (repeat_cnt > 4'd1 && !sweep_active) begin
                             // More pulses to deliver: go to gap
                             repeat_cnt  <= repeat_cnt - 4'd1;
@@ -251,7 +267,12 @@ module tt_um_santhosh_xbar_ctrl (
                     // Wait for ADC ready or use comparator
                     if (adc_ready) begin
                         reg_adc_data <= {4'b0, adc_data_lo}; // Read external ADC (zero-extended)
-                        if (sweep_active) begin
+                        // Compliance check: auto-abort if ADC exceeds threshold
+                        if (reg_ctrl[3] && ({4'b0, adc_data_lo} > reg_compliance)) begin
+                            compliance_hit <= 1'b1;
+                            sweep_active   <= 1'b0;
+                            state          <= S_REPORT;
+                        end else if (sweep_active) begin
                             // Return to sweep for next step (with wraparound check)
                             if (sweep_dac >= reg_sweep_end || reg_sweep_step == 8'd0 ||
                                 ({1'b0, sweep_dac} + {1'b0, reg_sweep_step}) > 9'd255) begin
@@ -318,8 +339,8 @@ module tt_um_santhosh_xbar_ctrl (
     // ============================================================
     // Status register
     // ============================================================
-    // Status register: [7:4]=0, [3]=sense_in, [2]=op_error, [1]=op_done, [0]=busy
-    assign reg_status = {4'b0, sense_in, op_error, op_done, (state != S_IDLE)};
+    // Status register: [7]=compliance_hit, [6:4]=0, [3]=sense_in, [2]=op_error, [1]=op_done, [0]=busy
+    assign reg_status = {compliance_hit, 3'b0, sense_in, op_error, op_done, (state != S_IDLE)};
 
     // ============================================================
     // Row/Column decoder outputs (directly usable on external bus)

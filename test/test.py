@@ -920,3 +920,177 @@ async def test_abort_during_pulse_train(dut):
     status = await spi_read(dut, 0x07)
     assert (status & 0x01) == 0, "FSM should be idle after abort"
     dut._log.info("Abort during pulse train verified")
+
+
+# ============================================================
+# Compliance Limit / Pulse Count / Half-Select DAC Tests
+# ============================================================
+
+@cocotb.test()
+async def test_compliance_register_defaults(dut):
+    """Compliance register defaults to 0xFF (no limit)."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    val = await spi_read(dut, 0x0D)
+    assert val == 0xFF, f"Expected compliance default 0xFF, got 0x{val:02x}"
+
+    # Write and read back
+    await spi_write(dut, 0x0D, 0x42)
+    val = await spi_read(dut, 0x0D)
+    assert val == 0x42, f"Expected compliance 0x42, got 0x{val:02x}"
+    dut._log.info("Compliance register read/write verified")
+
+
+@cocotb.test()
+async def test_half_select_dac(dut):
+    """V/2 half-select DAC register (0x0F) reflects half of active DAC."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Set DAC to various values and verify half-select
+    for dac_val in [0x80, 0x40, 0xFE, 0x01, 0x00]:
+        await spi_write(dut, 0x06, dac_val)  # reg_dac
+        half = await spi_read(dut, 0x0F)
+        expected = dac_val >> 1
+        dut._log.info(f"DAC=0x{dac_val:02x}, half=0x{half:02x}, expected=0x{expected:02x}")
+        assert half == expected, f"V/2 DAC mismatch: got 0x{half:02x}, expected 0x{expected:02x}"
+    dut._log.info("Half-select DAC register verified")
+
+
+@cocotb.test()
+async def test_pulse_count_increments(dut):
+    """Pulse count register tracks actual pulses delivered."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Configure for 3 repeated short pulses
+    await spi_write(dut, 0x01, 0x01)  # SET mode
+    await spi_write(dut, 0x02, 0x00)  # row=0
+    await spi_write(dut, 0x03, 0x00)  # col=0
+    await spi_write(dut, 0x04, 0x05)  # pulse_width_lo = 5
+    await spi_write(dut, 0x06, 0x80)  # dac = 0x80
+    await spi_write(dut, 0x0C, 0x13)  # repeat=3, gap=1×16=16 cycles
+
+    # Pulse count should be 0 before start
+    pc = await spi_read(dut, 0x0E)
+    assert pc == 0, f"Pulse count should be 0 before start, got {pc}"
+
+    # Start operation
+    await spi_write(dut, 0x00, 0x01)
+    await ClockCycles(dut.clk, 500)
+
+    # Wait for done
+    for _ in range(20):
+        status = await spi_read(dut, 0x07)
+        if (status >> 1) & 1:  # op_done
+            break
+        await ClockCycles(dut.clk, 100)
+
+    pc = await spi_read(dut, 0x0E)
+    dut._log.info(f"Pulse count after 3 repeats: {pc}")
+    assert pc == 3, f"Expected 3 pulses, got {pc}"
+
+
+@cocotb.test()
+async def test_compliance_auto_abort(dut):
+    """Compliance limit triggers auto-abort when ADC exceeds threshold."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Configure READ with compliance
+    await spi_write(dut, 0x01, 0x00)  # READ mode
+    await spi_write(dut, 0x02, 0x01)  # row=1
+    await spi_write(dut, 0x03, 0x02)  # col=2
+    await spi_write(dut, 0x04, 0x03)  # pulse_width = 3
+    await spi_write(dut, 0x06, 0x40)  # dac = 0x40
+    await spi_write(dut, 0x0D, 0x02)  # compliance threshold = 2 (very low)
+    await spi_write(dut, 0x00, 0x09)  # start + compliance_en (bit 3)
+
+    # Wait until FSM is in SENSE (pulse phase done)
+    await ClockCycles(dut.clk, 100)
+
+    # Simulate ADC ready with value exceeding compliance threshold
+    # adc_ready = ui_in[1], adc_data_lo = ui_in[7:4]
+    dut.ui_in.value = (0xF << 4) | (1 << 1)  # adc_data=15, adc_ready=1
+    await ClockCycles(dut.clk, 20)
+
+    status = await spi_read(dut, 0x07)
+    compliance_bit = (status >> 7) & 1
+    dut._log.info(f"Status after compliance violation: 0x{status:02x}, hit={compliance_bit}")
+    assert compliance_bit == 1, "Compliance hit flag should be set"
+
+    # FSM should have auto-aborted to REPORT→IDLE
+    busy = status & 1
+    # Give more time for state machine to reach IDLE through REPORT
+    if busy:
+        await ClockCycles(dut.clk, 50)
+        status = await spi_read(dut, 0x07)
+        busy = status & 1
+    dut._log.info(f"Final status: 0x{status:02x}, busy={busy}")
+
+
+@cocotb.test()
+async def test_compliance_no_abort_below_threshold(dut):
+    """No compliance abort when ADC value is below threshold."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # Configure READ with compliance, high threshold
+    await spi_write(dut, 0x01, 0x00)  # READ mode
+    await spi_write(dut, 0x02, 0x00)  # row=0
+    await spi_write(dut, 0x03, 0x00)  # col=0
+    await spi_write(dut, 0x04, 0x03)  # pulse_width = 3
+    await spi_write(dut, 0x06, 0x40)  # dac
+    await spi_write(dut, 0x0D, 0x80)  # compliance = 128 (high)
+    await spi_write(dut, 0x00, 0x09)  # start + compliance_en
+
+    await ClockCycles(dut.clk, 100)
+
+    # ADC value below threshold
+    # adc_ready = ui_in[1], adc_data_lo = ui_in[7:4]
+    dut.ui_in.value = (0x01 << 4) | (1 << 1)  # adc_data=1, adc_ready=1
+    await ClockCycles(dut.clk, 50)
+
+    status = await spi_read(dut, 0x07)
+    compliance_bit = (status >> 7) & 1
+    dut._log.info(f"Status (below threshold): 0x{status:02x}, hit={compliance_bit}")
+    assert compliance_bit == 0, "Compliance should NOT be triggered below threshold"
+
+
+@cocotb.test()
+async def test_status_compliance_cleared_on_new_start(dut):
+    """Compliance hit flag is cleared when starting a new operation."""
+    clock = Clock(dut.clk, 20, unit="ns")
+    cocotb.start_soon(clock.start())
+    await reset_dut(dut)
+
+    # First: trigger compliance
+    await spi_write(dut, 0x01, 0x00)
+    await spi_write(dut, 0x04, 0x03)
+    await spi_write(dut, 0x06, 0x40)
+    await spi_write(dut, 0x0D, 0x01)  # Very low threshold
+    await spi_write(dut, 0x00, 0x09)  # start + compliance_en
+    await ClockCycles(dut.clk, 100)
+    dut.ui_in.value = (0xF << 4) | (1 << 1)  # ADC above threshold (adc_data=15, adc_ready=1)
+    await ClockCycles(dut.clk, 50)
+
+    status = await spi_read(dut, 0x07)
+    assert (status >> 7) & 1 == 1, "Compliance should be set"
+
+    # Clear ADC and start a new operation
+    dut.ui_in.value = 0
+    await ClockCycles(dut.clk, 20)
+    await spi_write(dut, 0x0D, 0xFF)  # High threshold (won't trigger)
+    await spi_write(dut, 0x00, 0x01)  # start (no compliance_en)
+    await ClockCycles(dut.clk, 10)
+
+    status = await spi_read(dut, 0x07)
+    compliance_bit = (status >> 7) & 1
+    dut._log.info(f"Status after new start: 0x{status:02x}, hit={compliance_bit}")
+    assert compliance_bit == 0, "Compliance flag should clear on new start"

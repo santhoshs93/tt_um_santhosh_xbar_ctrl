@@ -3,7 +3,7 @@ project:
   title:        "Memristive Crossbar Peripheral Controller"
   author:       "Prof. Santhosh Sivasubramani, IIT Delhi"
   discord:      ""
-  description:  "Standalone 8-row × 8-column crossbar controller with READ/SET/RESET/FORMING/SWEEP modes, pulse-train support, device-agnostic SPI-configurable IP for memristive and spintronic arrays"
+  description:  "Standalone 8-row × 8-column crossbar controller with READ/SET/RESET/FORMING/SWEEP modes, pulse-train support, compliance current limit with auto-abort, V/2 half-select DAC for sneak-path mitigation, device-agnostic SPI-configurable IP for memristive and spintronic arrays"
   language:     "Verilog"
   clock_hz:     50000000
 
